@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 void display_usage() {
     printf("DUMMY [-h]\n");
     printf("-h\t\tDisplay this help message.\n");
