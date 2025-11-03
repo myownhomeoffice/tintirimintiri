@@ -25,3 +25,15 @@ cmake --build . --config Release
 ctest --output-on-failure
 # or run the test executable directly:
 # ./rbtree_map_tests
+
+Notes:
+
+The test suite includes a small DemoAllocator to exercise behavior when allocators differ.
+Tests compare behavior with std::map in several places to validate correctness.
+If your header is located elsewhere, adjust RBTREE_MAP_INCLUDE_DIR when invoking CMake:
+bash
+cmake -DRBTREE_MAP_INCLUDE_DIR=/path/to/include ..
+What's next
+
+If you'd like, I can add a CI configuration (GitHub Actions) to run the test matrix on multiple compilers and platforms.
+I can also expand tests to include heavy stress/fuzz testing and instrumentation to validate red-black invariants (black-height checks, no consecutive red nodes).
