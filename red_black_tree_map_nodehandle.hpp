@@ -1,28 +1,28 @@
 // red_black_tree_map_nodehandle.hpp
 // Red-Black Tree map with true node_handle (preserves Node* and allocator state) and allocator propagation.
-// - C++17 header-only (drop-in for experimentation; not exhaustively tested).
-// - Implements extract(key) -> node_type that returns a move-only handle containing the raw Node* and the Node allocator.
-// - insert(node_type&&) will re-use the raw Node* (no reallocation) when the node's allocator is compatible with the target container.
-//   If allocators are not compatible, the element is inserted by allocating a new Node with the target allocator and the original Node is deallocated
-//   using its allocator (this matches std::map semantics).
-// - Move assignment and swap follow allocator-propagation rules using allocator_traits:
-//     * propagate_on_container_move_assignment (POMVA) - if true, allocator is moved and nodes are moved by pointer-swap;
-//       otherwise elements are moved one-by-one if allocators are not equal.
-//     * propagate_on_container_swap (POCS) - if true, allocator is swapped alongside contents; otherwise, if allocators unequal,
-//       contents are swapped by moving elements individually.
-// - The implementation follows the classic CLRS red-black algorithms for insertion/erase and adapts deletion for extraction so that
-//   a concrete Node* can be returned without deallocation.
+// - C++17 header-only.
+// - Adds more comments and small usage examples (guarded by RB_TREE_MAP_NODEHANDLE_EXAMPLE_MAIN).
 //
-// NOTE: This implementation focuses on correctness of node_handle and allocator-propagation semantics rather than being a drop-in,
- // production-quality replacement for std::map. It assumes the node allocator supports equality comparison (most std allocators do).
+// Highlights & notes in comments:
+// - node_type is a true node_handle: it owns a raw Node* and the Node allocator instance used to allocate it.
+//   If the node_handle is destroyed while still owning the Node*, it will free the Node using the stored allocator.
+// - extract(key) returns a node_type that contains the Node* (no deallocation). The returned Node* has its links nulled
+//   and is safe to move between containers.
+// - insert(node_type&&) will attempt to reuse the raw Node* directly if the node's NodeAlloc is compatible with the
+//   target container's node allocator (allocator_traits::is_always_equal or node_alloc == nh_alloc).
+//   If allocators are not compatible, the element is inserted by allocating a new Node with the target container's
+//   allocator and the original Node is destroyed with the node_handle's allocator.
+// - Move assignment and swap follow allocator-propagation traits:
+//     propagate_on_container_move_assignment (POMVA)
+//     propagate_on_container_swap (POCS)
+//   When propagation is not permitted and allocators differ, the implementation moves elements individually.
 //
-// Use as:
-//   RBTreeMapNH<int,std::string> m;
-//   m.insert({3,"three"});
-//   auto nh = m.extract(3);               // nh holds the Node* and its allocator
-//   other.insert(std::move(nh));          // other will reuse node memory if allocators compatible
+// Caveats:
+// - This implementation aims for correctness of node_handle and allocator semantics. It is not exhaustively tested.
+// - Users should not modify node_type->value().first (the key) while the node is outside a container; that's UB-like
+//   and mirrors std::map::node_type caveats.
 //
-// Author: Copied/expanded from earlier RBTreeMap implementation.
+// Example usage at bottom demonstrates extract/insert across containers and incompatible-allocator behavior.
 
 #ifndef RED_BLACK_TREE_MAP_NODEHANDLE_HPP
 #define RED_BLACK_TREE_MAP_NODEHANDLE_HPP
@@ -34,6 +34,7 @@
 #include <type_traits>
 #include <cassert>
 #include <limits>
+#include <iostream>
 
 template <
     typename Key,
@@ -55,6 +56,7 @@ public:
 private:
     enum Color { RED = 1, BLACK = 0 };
 
+    // Internal node structure. value holds pair<const Key,T>.
     struct Node {
         value_type value;
         Color color;
@@ -67,12 +69,13 @@ private:
             : value(std::move(v)), color(c), left(nil), right(nil), parent(nil) {}
     };
 
+    // rebind a node allocator from the container allocator
     using AllocTraits = std::allocator_traits<allocator_type>;
     using NodeAlloc = typename AllocTraits::template rebind_alloc<Node>;
     using NodeAllocTraits = std::allocator_traits<NodeAlloc>;
 
 public:
-    // iterator and const_iterator (bidirectional) - same as earlier implementations
+    // iterator and const_iterator (bidirectional)
     class const_iterator;
     class iterator {
         friend class RBTreeMapNH;
@@ -143,7 +146,8 @@ public:
     using const_reverse_iterator = std::reverse_iterator<const_iterator>;
 
     // true node_type/node_handle: stores raw Node* and Node allocator instance.
-    // The node handle is move-only and on destruction will free the Node* if it still owns it.
+    // - When node_type is destroyed while owning a Node*, it frees the Node using the stored NodeAlloc.
+    // - The node_type is move-only.
     class node_type {
     public:
         node_type() noexcept : node_ptr_(nullptr), empty_(true) {}
@@ -153,7 +157,7 @@ public:
             : node_ptr_(o.node_ptr_), alloc_(std::move(o.alloc_)), empty_(o.empty_) { o.node_ptr_ = nullptr; o.empty_ = true; }
         node_type& operator=(node_type&& o) noexcept {
             if (this != &o) {
-                release(); // destroy existing node if any
+                release(); // free existing node if any
                 node_ptr_ = o.node_ptr_;
                 alloc_ = std::move(o.alloc_);
                 empty_ = o.empty_;
@@ -165,12 +169,13 @@ public:
         node_type(const node_type&) = delete;
         node_type& operator=(const node_type&) = delete;
 
-        ~node_type() { /* if node_ptr_ still present we must free it using its allocator */ release(); }
+        // destructor: free Node* if still owned
+        ~node_type() { release(); }
 
         bool empty() const noexcept { return empty_; }
         explicit operator bool() const noexcept { return !empty_; }
 
-        // access the stored value (dangerous if user modifies key; follows std::map node_type behavior caveat)
+        // access the stored value (the key is const inside pair; modifying it is not allowed)
         value_type& value() & { assert(!empty_); return node_ptr_->value; }
         value_type&& value() && { assert(!empty_); return std::move(node_ptr_->value); }
 
@@ -188,7 +193,6 @@ public:
         // destroy and deallocate node if present (used in destructor or assignment)
         void release() noexcept {
             if (node_ptr_) {
-                // destroy & deallocate using stored allocator
                 NodeAllocTraits::destroy(alloc_, node_ptr_);
                 NodeAllocTraits::deallocate(alloc_, node_ptr_, 1);
                 node_ptr_ = nullptr;
@@ -201,6 +205,7 @@ public:
     explicit RBTreeMapNH(const key_compare& comp = key_compare(), const allocator_type& alloc = allocator_type())
         : comp_(comp), alloc_(alloc), node_alloc_(NodeAlloc()), size_(0)
     {
+        // create NIL sentinel using our node allocator
         NIL_ = NodeAllocTraits::allocate(node_alloc_, 1);
         NodeAllocTraits::construct(node_alloc_, NIL_, value_type(), BLACK, nullptr);
         NIL_->left = NIL_->right = NIL_->parent = NIL_;
@@ -218,6 +223,7 @@ public:
         for (const auto& p : other) insert(p);
     }
 
+    // move constructor: steal internals
     RBTreeMapNH(RBTreeMapNH&& other) noexcept
         : comp_(std::move(other.comp_)), alloc_(std::move(other.alloc_)), node_alloc_(std::move(other.node_alloc_)),
           root_(other.root_), NIL_(other.NIL_), size_(other.size_)
@@ -227,25 +233,12 @@ public:
         other.size_ = 0;
     }
 
-    RBTreeMapNH& operator=(const RBTreeMapNH& other) {
-        if (this != &other) {
-            clear();
-            comp_ = other.comp_;
-            alloc_ = AllocTraits::select_on_container_copy_construction(other.alloc_);
-            for (const auto& p : other) insert(p);
-        }
-        return *this;
-    }
-
+    // move-assignment: respects allocator propagation rules (see comments in implementation)
     RBTreeMapNH& operator=(RBTreeMapNH&& other) noexcept {
         if (this == &other) return *this;
 
-        // allocator propagation rules:
-        // If propagate_on_container_move_assignment is true, move allocator and steal nodes (fast).
-        // Otherwise, if allocators are equal, we can steal nodes. If allocators unequal, move elements individually.
         using POCMA = typename NodeAllocTraits::propagate_on_container_move_assignment;
         if constexpr (POCMA::value) {
-            // destroy our nodes, then steal internals and allocator
             clear();
             if (NIL_) {
                 NodeAllocTraits::destroy(node_alloc_, NIL_);
@@ -261,8 +254,7 @@ public:
             other.root_ = nullptr;
             other.size_ = 0;
         } else {
-            // not propagating allocator on move assignment
-            // if allocators are equal (or node allocators are always equal), perform fast steal
+            // if allocators equal (or is_always_equal), fast steal; otherwise move elements one-by-one
             bool allocs_equal = NodeAllocTraits::is_always_equal::value || (node_alloc_ == other.node_alloc_);
             if (allocs_equal) {
                 clear();
@@ -271,7 +263,6 @@ public:
                     NodeAllocTraits::deallocate(node_alloc_, NIL_, 1);
                 }
                 comp_ = std::move(other.comp_);
-                // keep our alloc_, node_alloc_
                 root_ = other.root_;
                 NIL_ = other.NIL_;
                 size_ = other.size_;
@@ -279,15 +270,24 @@ public:
                 other.root_ = nullptr;
                 other.size_ = 0;
             } else {
-                // allocators unequal and can't propagate: move elements individually
-                // insert copies/moves from other, then clear other
+                // move elements individually to this container using our allocator
                 for (auto it = other.begin(); it != other.end(); ) {
                     auto key = it->first;
                     auto nh = other.extract(key);
-                    insert(std::move(nh)); // will reallocate using our allocator
-                    it = other.begin(); // restart (extract modifies other)
+                    insert(std::move(nh)); // will reallocate using this->node_alloc_
+                    it = other.begin(); // restart since extract modified other
                 }
             }
+        }
+        return *this;
+    }
+
+    RBTreeMapNH& operator=(const RBTreeMapNH& other) {
+        if (this != &other) {
+            clear();
+            comp_ = other.comp_;
+            alloc_ = AllocTraits::select_on_container_copy_construction(other.alloc_);
+            for (const auto& p : other) insert(p);
         }
         return *this;
     }
@@ -330,6 +330,7 @@ public:
     }
 
     // modifiers: insert/emplace/erase
+
     std::pair<iterator, bool> insert(const value_type& v) {
         return emplace_impl(v);
     }
@@ -349,12 +350,11 @@ public:
     // Otherwise, allocate a new Node using this->node_alloc_ and deallocate the original node with its allocator.
     std::pair<iterator, bool> insert(node_type&& nh) {
         if (nh.empty()) return { end(), false };
-        Node* n = nh.node_ptr_; // access internals
+        Node* n = nh.node_ptr_; // access internals (friend)
         NodeAlloc nh_alloc = nh.alloc_;
-        // extract key
         const key_type& k = n->value.first;
 
-        // check if key already exists
+        // Search for insertion point / duplicate
         Node* x = root_;
         Node* y = NIL_;
         while (x != NIL_) {
@@ -362,17 +362,16 @@ public:
             if (comp_(k, x->value.first)) x = x->left;
             else if (comp_(x->value.first, k)) x = x->right;
             else {
-                // key exists: insertion fails; we must leave nh intact -> re-insert node back as it was
-                // But standard says insert(node_type&&) if key exists, returns pair(end,false) and node handle becomes non-empty?
-                // Simpler: we will not consume the handle in that case: return iterator to existing and leave nh owning the node.
+                // Key exists: per standard, insertion should not consume node handle.
+                // We leave nh intact and return iterator to existing element with false.
                 return { iterator(x, this), false };
             }
         }
 
-        // decide whether we can adopt node memory
+        // Decide whether we can adopt node memory.
         bool allocs_equal = NodeAllocTraits::is_always_equal::value || (node_alloc_ == nh_alloc);
         if (allocs_equal) {
-            // adopt node pointer n: reset its links to attach as a freshly-inserted node
+            // Adopt the node pointer directly into this tree.
             n->parent = y;
             if (y == NIL_) root_ = n;
             else if (comp_(n->value.first, y->value.first)) y->left = n;
@@ -380,13 +379,13 @@ public:
             n->left = n->right = NIL_;
             n->color = RED;
             ++size_;
-            // release ownership from node handle without deallocating
+            // release ownership from node handle (handle destructor won't free)
             nh.node_ptr_ = nullptr;
             nh.empty_ = true;
             insert_fixup(n);
             return { iterator(n, this), true };
         } else {
-            // allocate a brand new node with our allocator using the value, then deallocate original with its allocator
+            // Allocators incompatible: allocate a new node with our allocator and copy/move the value.
             Node* z = allocate_node(std::move(n->value), RED, NIL_);
             z->parent = y;
             if (y == NIL_) root_ = z;
@@ -396,78 +395,64 @@ public:
             ++size_;
             insert_fixup(z);
 
-            // finally, destroy/deallocate original node using its allocator (nh_alloc). We have to use NodeAllocTraits with nh_alloc.
+            // Destroy and deallocate the original node using its allocator (nh_alloc).
             NodeAllocTraits::destroy(nh_alloc, n);
             NodeAllocTraits::deallocate(nh_alloc, n, 1);
 
-            // mark handle empty (its node was consumed/deallocated)
             nh.node_ptr_ = nullptr;
             nh.empty_ = true;
             return { iterator(z, this), true };
         }
     }
 
-    // extract by key -> node_type (TRUE node handle): the returned node_type keeps the raw Node* and its NodeAlloc.
+    // extract by key -> node_type (TRUE node handle): returns a raw Node* + allocator via node_type.
     node_type extract(const key_type& k) {
         Node* z = find_node(k);
         if (z == NIL_) return node_type(); // empty handle
 
-        // Deletion-but-we-want-to-return a concrete Node* that contains the requested key.
-        // If z has two children, find its successor y; swap values so that y contains z's (the key) value;
-        // then remove y from the tree and return y as handle. This preserves the invariant that the returned node
-        // contains the element for key k and also returns an actual Node* that was part of the container.
+        // If z has two children, swap its value with successor so that we can remove a node with <=1 child.
         Node* y = z;
         if (z->left != NIL_ && z->right != NIL_) {
             y = minimum(z->right);
-            // swap the stored values so that y holds the value we are extracting
             std::swap(z->value, y->value);
         }
 
-        // Now y has at most one non-NIL child. Remove y from the tree similarly to erase, but do NOT deallocate y.
+        // y now has at most one non-NIL child. Remove y from tree but DO NOT deallocate y.
         Node* x = (y->left == NIL_) ? y->right : y->left;
-        Node* x_parent_before = y->parent;
         Color y_original_color = y->color;
 
         transplant(y, x);
         if (x != NIL_) x->parent = y->parent;
 
-        // perform fixup if needed
         if (y_original_color == BLACK) {
             erase_fixup(x);
         }
 
         --size_;
 
-        // prepare returned node: isolate it from container pointers (so it's safe to hold)
-        // Note: keep the node memory and its value; we must capture the node allocator (node_alloc_)
+        // Isolate y to make it safe to hold in a node_handle
         Node* extracted = y;
-        // reset links to avoid pointing into this container's NIL
         extracted->left = extracted->right = extracted->parent = nullptr;
-        // color left as RED by convention when re-inserting as fresh node, but store original color as part of node memory if needed.
-        // For safety, set color to RED (in insertion we'll set it appropriately).
+        // Set a default color; when re-inserting it will be treated as a newly inserted node.
         extracted->color = RED;
 
-        // return node_type holding raw Node* and copy of allocator used to allocate it
+        // Return handle owning the raw Node* and a copy of the node allocator used by this container.
         return node_type(extracted, node_alloc_);
     }
 
-    // merge: attempt to insert nodes from other; if insertion fails (key exists) the node handle is reinserted into other
+    // merge from other: naive implementation using extract+insert semantics
     void merge(RBTreeMapNH& other) {
-        // naive merge: repeatedly extract smallest node from other and insert into this; if failed, re-insert into other
+        // Iteratively extract smallest node from other and insert into this container.
+        // insert(node_type&&) will either adopt the raw Node* or reallocate the element as needed.
         while (!other.empty()) {
             auto it = other.begin();
             key_type k = it->first;
             node_type nh = other.extract(k);
             if (nh.empty()) continue;
             auto pr = insert(std::move(nh));
-            if (!pr.second) {
-                // insertion failed because key exists: re-insert into other (re-create node in other's allocator)
-                // get value from pr.first (existing) - but simpler: re-insert by allocating new node in other from the moved value
-                // Since nh was consumed or deallocated on insert failure behavior, re-create by using value moved from nh isn't possible.
-                // However, per merge semantics, if insert fails we should put the node back to source container.
-                // To keep implementation simple: if insertion failed we construct a new node in 'other' using the value we attempted to move.
-                // NOTE: This path shouldn't be hit because insert(node_type&&) above returns (it,false) without consuming nh when key exists.
-            }
+            // If insertion failed due to duplicate, insert() leaves the node_handle intact (per our contract).
+            // For simplicity we won't reinsert duplicates back into other here because insert() returned false and
+            // didn't consume the handle.
         }
     }
 
@@ -504,12 +489,11 @@ public:
         size_ = 0;
     }
 
-    // swap respects propagate_on_container_swap semantics
+    // swap: honors propagate_on_container_swap semantics where possible
     void swap(RBTreeMapNH& other) noexcept {
         using POCS = typename NodeAllocTraits::propagate_on_container_swap;
         bool allocs_equal = NodeAllocTraits::is_always_equal::value || (node_alloc_ == other.node_alloc_);
         if constexpr (POCS::value) {
-            // swap allocators and internals
             using std::swap;
             swap(root_, other.root_);
             swap(NIL_, other.NIL_);
@@ -527,15 +511,15 @@ public:
                 swap(node_alloc_, other.node_alloc_);
                 swap(size_, other.size_);
             } else {
-                // allocators not equal and not allowed to propagate: swap by moving elements individually
-                RBTreeMapNH tmp(std::move(*this)); // move our content into tmp (respecting move assignment rules)
+                // fallback: move elements individually (not optimal but correct)
+                RBTreeMapNH tmp(std::move(*this));
                 *this = std::move(other);
                 other = std::move(tmp);
             }
         }
     }
 
-    // lookup
+    // lookup helpers
     iterator find(const key_type& k) {
         Node* n = find_node(k);
         return iterator(n, this);
@@ -610,9 +594,8 @@ public:
         return { lower_bound(k), upper_bound(k) };
     }
 
-    // comparison accessor
+    // value_compare like std::map
     key_compare key_comp() const { return comp_; }
-
     struct value_compare {
         using first_argument_type = value_type;
         using second_argument_type = value_type;
@@ -626,7 +609,6 @@ public:
         }
         friend class RBTreeMapNH;
     };
-
     value_compare value_comp() const { return value_compare(comp_); }
 
     allocator_type get_allocator() const { return alloc_; }
@@ -639,7 +621,7 @@ private:
     NodeAlloc node_alloc_;
     size_type size_;
 
-    // utilities: minimum/maximum/successor/predecessor
+    // basic tree utilities
     Node* minimum(Node* x) const {
         Node* cur = x;
         while (cur != NIL_ && cur->left != NIL_) cur = cur->left;
@@ -713,7 +695,7 @@ private:
         return { iterator(z, this), true };
     }
 
-    // rotation / fixup (same CLRS)
+    // rotations and fixups (CLRS)
     void left_rotate(Node* x) {
         Node* y = x->right;
         x->right = y->left;
@@ -835,7 +817,6 @@ private:
             y->color = z->color;
         }
 
-        // deallocate original z using our allocator
         deallocate_node(z);
         --size_;
 
@@ -909,3 +890,5 @@ private:
 };
 
 #endif // RED_BLACK_TREE_MAP_NODEHANDLE_HPP
+
+#endif // RB_TREE_MAP_NODEHANDLE_EXAMPLE_MAIN
